@@ -1,0 +1,5 @@
+grant {
+    // No additional permissions required.
+    // The plugin operates within the Elasticsearch security sandbox
+    // using standard index reader and circuit breaker APIs.
+};

@@ -1,0 +1,40 @@
+plugins {
+    id 'java'
+}
+
+group = 'io.scinapse.elasticsearch'
+version = '1.0.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'elastic'
+        url = 'https://artifacts.elastic.co/maven'
+    }
+}
+
+def esVersion = '8.17.0'
+
+dependencies {
+    compileOnly "org.elasticsearch:elasticsearch:${esVersion}"
+}
+
+// ES 플러그인 ZIP 패키징
+tasks.register('bundlePlugin', Zip) {
+    from jar
+    from('src/main/plugin-metadata') {
+        include 'plugin-descriptor.properties'
+        include 'plugin-security.policy'
+    }
+    archiveBaseName.set('es-bulk-id-export')
+    destinationDirectory.set(layout.buildDirectory.dir('distributions'))
+}
+
+tasks.named('build') {
+    dependsOn 'bundlePlugin'
+}
