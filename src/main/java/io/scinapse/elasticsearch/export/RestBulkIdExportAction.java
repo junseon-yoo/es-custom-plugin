@@ -59,6 +59,10 @@ public class RestBulkIdExportAction extends BaseRestHandler {
                     restResponse.addHeader("X-Total-Shards", String.valueOf(response.getTotalShards()));
                     restResponse.addHeader("X-Successful-Shards", String.valueOf(response.getSuccessfulShards()));
                     restResponse.addHeader("X-Failed-Shards", String.valueOf(response.getFailedShards()));
+                    if (response.getShardFailures() != null && response.getShardFailures().length > 0) {
+                        String reason = response.getShardFailures()[0].reason();
+                        restResponse.addHeader("X-Failure-Reason", reason.replace("\n", " ").substring(0, Math.min(reason.length(), 500)));
+                    }
                     channel.sendResponse(restResponse);
                 }
             }

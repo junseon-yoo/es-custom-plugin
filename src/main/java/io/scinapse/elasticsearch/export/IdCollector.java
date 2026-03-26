@@ -2,76 +2,95 @@ package io.scinapse.elasticsearch.export;
 
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SortedDocValues;
+import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.SimpleCollector;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.breaker.CircuitBreaker;
-import org.elasticsearch.common.breaker.CircuitBreakingException;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.tasks.TaskCancelledException;
 
 import java.io.IOException;
 import java.util.function.BooleanSupplier;
 
-/**
- * Lucene Collector that reads document IDs from doc_values directly to bytes.
- * - Writes BytesRef → BytesStreamOutput without String conversion
- * - Checks cancellation every 8192 docs
- * - Tracks memory via circuit breaker
- */
 public class IdCollector extends SimpleCollector {
 
-    private static final int CANCEL_CHECK_INTERVAL = 8192;
+    private static final int CANCEL_CHECK_INTERVAL = 16384;
+    private static final int BREAKER_CHECK_INTERVAL = 65536;
 
     private final String field;
     private final BytesStreamOutput out;
     private final BooleanSupplier isCancelled;
     private final CircuitBreaker breaker;
-    private SortedDocValues docValues;
+
+    private SortedDocValues sortedDv;
+    private SortedSetDocValues sortedSetDv;
     private long count;
     private long trackedBytes;
 
     public IdCollector(String field, BooleanSupplier isCancelled, CircuitBreaker breaker) {
         this.field = field;
-        this.out = new BytesStreamOutput();
+        this.out = new BytesStreamOutput(1024 * 1024);
         this.isCancelled = isCancelled;
         this.breaker = breaker;
     }
 
     @Override
     protected void doSetNextReader(LeafReaderContext context) throws IOException {
-        SortedDocValues dv = context.reader().getSortedDocValues(field);
-        if (dv == null) {
-            throw new IllegalStateException(
-                "field [" + field + "] has no doc_values in segment [" + context.reader() + "]. " +
-                "Ensure the field is mapped as keyword with doc_values enabled."
-            );
+        this.sortedDv = null;
+        this.sortedSetDv = null;
+
+        // Try SortedDocValues first (single-valued keyword)
+        SortedDocValues sdv = context.reader().getSortedDocValues(field);
+        if (sdv != null) {
+            this.sortedDv = sdv;
+            return;
         }
-        this.docValues = dv;
+
+        // Try SortedSetDocValues (multi-valued keyword or ES keyword default)
+        SortedSetDocValues ssdv = context.reader().getSortedSetDocValues(field);
+        if (ssdv != null) {
+            this.sortedSetDv = ssdv;
+            return;
+        }
+
+        throw new IllegalStateException(
+            "field [" + field + "] has no SortedDocValues or SortedSetDocValues. " +
+            "Available fields: " + context.reader().getFieldInfos().size()
+        );
     }
 
     @Override
     public void collect(int doc) throws IOException {
-        if (++count % CANCEL_CHECK_INTERVAL == 0 && isCancelled.getAsBoolean()) {
-            throw new TaskCancelledException("bulk_id_export cancelled after " + count + " docs");
+        count++;
+        if (count % CANCEL_CHECK_INTERVAL == 0 && isCancelled.getAsBoolean()) {
+            throw new TaskCancelledException("cancelled after " + count + " docs");
         }
 
-        if (docValues.advanceExact(doc)) {
-            BytesRef value = docValues.lookupOrd(docValues.ordValue());
-            long bytesNeeded = value.length + 1L; // +1 for newline
-
-            if (breaker != null) {
-                try {
-                    breaker.addEstimateBytesAndMaybeBreak(bytesNeeded, "bulk_id_export");
-                } catch (CircuitBreakingException e) {
-                    releaseBreaker();
-                    throw e;
-                }
-                trackedBytes += bytesNeeded;
+        if (sortedDv != null) {
+            if (sortedDv.advanceExact(doc)) {
+                BytesRef value = sortedDv.lookupOrd(sortedDv.ordValue());
+                out.writeBytes(value.bytes, value.offset, value.length);
+                out.writeByte((byte) '\n');
             }
+        } else if (sortedSetDv != null) {
+            if (sortedSetDv.advanceExact(doc)) {
+                long ord = sortedSetDv.nextOrd();
+                if (ord != SortedSetDocValues.NO_MORE_ORDS) {
+                    BytesRef value = sortedSetDv.lookupOrd(ord);
+                    out.writeBytes(value.bytes, value.offset, value.length);
+                    out.writeByte((byte) '\n');
+                }
+            }
+        }
 
-            out.writeBytes(value.bytes, value.offset, value.length);
-            out.writeByte((byte) '\n');
+        if (breaker != null && count % BREAKER_CHECK_INTERVAL == 0) {
+            long currentBytes = out.size();
+            long delta = currentBytes - trackedBytes;
+            if (delta > 0) {
+                breaker.addEstimateBytesAndMaybeBreak(delta, "bulk_id_export");
+                trackedBytes = currentBytes;
+            }
         }
     }
 
@@ -80,17 +99,9 @@ public class IdCollector extends SimpleCollector {
         return ScoreMode.COMPLETE_NO_SCORES;
     }
 
-    public BytesStreamOutput output() {
-        return out;
-    }
+    public BytesStreamOutput output() { return out; }
+    public long count() { return count; }
 
-    public long count() {
-        return count;
-    }
-
-    /**
-     * Release circuit breaker reservation. Call this after bytes are consumed.
-     */
     public void releaseBreaker() {
         if (breaker != null && trackedBytes > 0) {
             breaker.addWithoutBreaking(-trackedBytes);

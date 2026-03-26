@@ -133,19 +133,19 @@ public class TransportBulkIdExportAction extends TransportBroadcastByNodeAction<
                 var cancelCheck = (java.util.function.BooleanSupplier)
                     (() -> task instanceof org.elasticsearch.tasks.CancellableTask ct && ct.isCancelled());
 
+                var createdCollectors = java.util.Collections.synchronizedList(new ArrayList<IdCollector>());
+
                 CollectorManager<IdCollector, ShardExportResult> manager = new CollectorManager<>() {
                     @Override
                     public IdCollector newCollector() {
-                        return new IdCollector(request.field(), cancelCheck, breaker);
+                        IdCollector c = new IdCollector(request.field(), cancelCheck, breaker);
+                        createdCollectors.add(c);
+                        return c;
                     }
 
                     @Override
                     public ShardExportResult reduce(java.util.Collection<IdCollector> collectors) {
                         try {
-                            if (collectors.size() == 1) {
-                                IdCollector c = collectors.iterator().next();
-                                return new ShardExportResult(c.output().bytes(), c.count());
-                            }
                             var parts = new ArrayList<BytesReference>(collectors.size());
                             long total = 0;
                             for (IdCollector c : collectors) {
@@ -169,8 +169,11 @@ public class TransportBulkIdExportAction extends TransportBroadcastByNodeAction<
                 try {
                     ShardExportResult result = searcher.search(luceneQuery, manager);
                     listener.onResponse(result);
-                } finally {
-                    // breaker release handled per-collector in reduce or on error
+                } catch (Exception e) {
+                    for (IdCollector c : createdCollectors) {
+                        c.releaseBreaker();
+                    }
+                    throw e;
                 }
             }
         } catch (Exception e) {
