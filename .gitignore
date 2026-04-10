@@ -8,3 +8,6 @@ build/
 .settings/
 .project
 .classpath
+
+# Gradle wrapper jar must be checked in for CI/repo users
+!gradle/wrapper/gradle-wrapper.jar
