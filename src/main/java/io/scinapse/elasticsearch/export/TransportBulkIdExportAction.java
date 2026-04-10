@@ -3,6 +3,7 @@ package io.scinapse.elasticsearch.export;
 import org.apache.lucene.search.CollectorManager;
 import org.apache.lucene.search.Query;
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.NoShardAvailableActionException;
 import org.elasticsearch.action.support.ActionFilters;
 import org.elasticsearch.action.support.DefaultShardOperationFailedException;
 import org.elasticsearch.action.support.broadcast.node.TransportBroadcastByNodeAction;
@@ -10,6 +11,9 @@ import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.block.ClusterBlockException;
 import org.elasticsearch.cluster.block.ClusterBlockLevel;
 import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
+import org.elasticsearch.cluster.routing.IndexRoutingTable;
+import org.elasticsearch.cluster.routing.IndexShardRoutingTable;
+import org.elasticsearch.cluster.routing.PlainShardsIterator;
 import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.cluster.routing.ShardsIterator;
 import org.elasticsearch.cluster.service.ClusterService;
@@ -27,7 +31,9 @@ import org.elasticsearch.index.shard.IndexShard;
 import org.elasticsearch.indices.IndicesService;
 import org.elasticsearch.indices.breaker.CircuitBreakerService;
 import org.elasticsearch.injection.guice.Inject;
+import org.elasticsearch.tasks.CancellableTask;
 import org.elasticsearch.tasks.Task;
+import org.elasticsearch.tasks.TaskCancelledException;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.TransportService;
 
@@ -111,6 +117,15 @@ public class TransportBulkIdExportAction extends TransportBroadcastByNodeAction<
             Task task,
             ActionListener<ShardExportResult> listener
     ) {
+        // Early cancellation check — avoid acquiring searcher and rewriting
+        // the query if the task has already been cancelled.
+        if (task instanceof CancellableTask ct && ct.isCancelled()) {
+            listener.onFailure(new TaskCancelledException(
+                "bulk_id_export cancelled before shard [" + shardRouting.shardId() + "] execution"
+            ));
+            return;
+        }
+
         try {
             IndexService indexService = indicesService.indexServiceSafe(shardRouting.shardId().getIndex());
             IndexShard indexShard = indexService.getShard(shardRouting.shardId().id());
@@ -131,7 +146,7 @@ public class TransportBulkIdExportAction extends TransportBroadcastByNodeAction<
                 Query luceneQuery = rewritten.toQuery(context);
 
                 var cancelCheck = (java.util.function.BooleanSupplier)
-                    (() -> task instanceof org.elasticsearch.tasks.CancellableTask ct && ct.isCancelled());
+                    (() -> task instanceof CancellableTask ct && ct.isCancelled());
 
                 var createdCollectors = java.util.Collections.synchronizedList(new ArrayList<IdCollector>());
 
@@ -170,7 +185,16 @@ public class TransportBulkIdExportAction extends TransportBroadcastByNodeAction<
                     ShardExportResult result = searcher.search(luceneQuery, manager);
                     listener.onResponse(result);
                 } catch (Exception e) {
-                    for (IdCollector c : createdCollectors) {
+                    // Snapshot under the list's monitor before iterating.
+                    // Collections.synchronizedList requires manual synchronization
+                    // when iterating. In practice all collection threads have
+                    // already stopped by the time search() throws, but taking
+                    // a snapshot makes the memory model explicit.
+                    List<IdCollector> snapshot;
+                    synchronized (createdCollectors) {
+                        snapshot = new ArrayList<>(createdCollectors);
+                    }
+                    for (IdCollector c : snapshot) {
                         c.releaseBreaker();
                     }
                     throw e;
@@ -183,7 +207,40 @@ public class TransportBulkIdExportAction extends TransportBroadcastByNodeAction<
 
     @Override
     protected ShardsIterator shards(ClusterState clusterState, BulkIdExportRequest request, String[] concreteIndices) {
-        return clusterState.routingTable().allShards(concreteIndices);
+        // IMPORTANT: select exactly one active copy per shard id.
+        // routingTable().allShards() returns primary + all replicas, which would
+        // cause each document to be exported once per copy (2x for 1-replica setup).
+        //
+        // Prefer active primary; fall back to an active replica if primary is
+        // unavailable (e.g. during relocation or failover).
+        // If a shard id has NO active copies, fail fast — silently skipping
+        // would produce partial results indistinguishable from success.
+        List<ShardRouting> selectedShards = new ArrayList<>();
+        for (String indexName : concreteIndices) {
+            IndexRoutingTable indexRouting = clusterState.routingTable().index(indexName);
+            if (indexRouting == null) {
+                continue;
+            }
+            for (int i = 0; i < indexRouting.size(); i++) {
+                IndexShardRoutingTable shardRouting = indexRouting.shard(i);
+                ShardRouting primary = shardRouting.primaryShard();
+                if (primary != null && primary.active()) {
+                    selectedShards.add(primary);
+                    continue;
+                }
+                List<ShardRouting> active = shardRouting.activeShards();
+                if (active.isEmpty() == false) {
+                    selectedShards.add(active.get(0));
+                    continue;
+                }
+                throw new NoShardAvailableActionException(
+                    shardRouting.shardId(),
+                    "no active shard copy available for [" + shardRouting.shardId()
+                        + "] — bulk_id_export requires all shards to be available to avoid partial results"
+                );
+            }
+        }
+        return new PlainShardsIterator(selectedShards);
     }
 
     @Override
