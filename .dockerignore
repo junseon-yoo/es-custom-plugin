@@ -8,6 +8,6 @@ build/classes/
 build/resources/
 build/generated/
 !build/distributions/
-docker-context/
-gradle/wrapper/gradle-wrapper.jar
+# docker-context/plugin/ is created by the CI pipeline and consumed
+# by the Dockerfile — must NOT be ignored.
 *.iml
