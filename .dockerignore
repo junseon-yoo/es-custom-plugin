@@ -1,0 +1,13 @@
+.git/
+.gradle/
+.idea/
+build/libs/
+build/tmp/
+build/reports/
+build/classes/
+build/resources/
+build/generated/
+!build/distributions/
+docker-context/
+gradle/wrapper/gradle-wrapper.jar
+*.iml
