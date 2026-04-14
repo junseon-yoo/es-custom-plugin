@@ -63,7 +63,8 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: projects/944835544118/locations/global/workloadIdentityPools/wif-pool/providers/github
+          service_account: github-action-deployment@pluto-api-362701.iam.gserviceaccount.com
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
